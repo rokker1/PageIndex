@@ -8,6 +8,8 @@ from .utils import *
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+PROMPT_MAX_TOKENS = int(os.getenv("PAGEINDEX_PROMPT_MAX_TOKENS", "12000"))
+
 
 ################### check title in page #########################################################
 async def check_title_appearance(item, page_list, start_index=1, model=None):    
@@ -415,7 +417,7 @@ def add_page_offset_to_toc_json(data, offset):
 
 
 
-def page_list_to_group_text(page_contents, token_lengths, max_tokens=20000, overlap_page=1):    
+def page_list_to_group_text(page_contents, token_lengths, max_tokens=PROMPT_MAX_TOKENS, overlap_page=1):    
     num_tokens = sum(token_lengths)
     
     if num_tokens <= max_tokens:
@@ -562,6 +564,10 @@ def generate_toc_init(part, model=None):
 
     if finish_reason == 'finished':
          return extract_json(response)
+    if finish_reason == 'context_length_exceeded':
+        raise Exception(
+            f"finish reason: {finish_reason}. Reduce prompt size: lower PAGEINDEX_PROMPT_MAX_TOKENS (current {PROMPT_MAX_TOKENS})"
+        )
     else:
         raise Exception(f'finish reason: {finish_reason}')
 
@@ -572,7 +578,7 @@ def process_no_toc(page_list, start_index=1, model=None, logger=None):
         page_text = f"<physical_index_{page_index}>\n{page_list[page_index-start_index][0]}\n<physical_index_{page_index}>\n\n"
         page_contents.append(page_text)
         token_lengths.append(count_tokens(page_text, model))
-    group_texts = page_list_to_group_text(page_contents, token_lengths)
+    group_texts = page_list_to_group_text(page_contents, token_lengths, max_tokens=PROMPT_MAX_TOKENS)
     logger.info(f'len(group_texts): {len(group_texts)}')
 
     toc_with_page_number= generate_toc_init(group_texts[0], model)
@@ -596,7 +602,7 @@ def process_toc_no_page_numbers(toc_content, toc_page_list, page_list,  start_in
         page_contents.append(page_text)
         token_lengths.append(count_tokens(page_text, model))
     
-    group_texts = page_list_to_group_text(page_contents, token_lengths)
+    group_texts = page_list_to_group_text(page_contents, token_lengths, max_tokens=PROMPT_MAX_TOKENS)
     logger.info(f'len(group_texts): {len(group_texts)}')
 
     toc_with_page_number=copy.deepcopy(toc_content)

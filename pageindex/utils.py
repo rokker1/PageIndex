@@ -9,6 +9,8 @@ import PyPDF2
 import copy
 import asyncio
 import pymupdf
+from urllib import request, error
+from urllib.parse import urlparse
 from io import BytesIO
 from dotenv import load_dotenv
 load_dotenv()
@@ -17,18 +19,174 @@ import yaml
 from pathlib import Path
 from types import SimpleNamespace as config
 
-CHATGPT_API_KEY = os.getenv("CHATGPT_API_KEY")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") or os.getenv("CHATGPT_API_KEY")
+OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL")
+
+
+def _build_openai_client(async_client=False, api_key=None):
+    """
+    Build an OpenAI/compatible client with optional custom base URL.
+
+    Supported env vars:
+      - OPENAI_API_KEY (preferred)
+      - CHATGPT_API_KEY (backward compatibility)
+      - OPENAI_BASE_URL (for OpenAI-compatible providers)
+    """
+    effective_api_key = api_key or OPENAI_API_KEY
+    client_kwargs = {"api_key": effective_api_key}
+    if OPENAI_BASE_URL:
+        client_kwargs["base_url"] = OPENAI_BASE_URL
+
+    if async_client:
+        return openai.AsyncOpenAI(**client_kwargs)
+    return openai.OpenAI(**client_kwargs)
+
+def _candidate_tokenize_urls(base_url):
+    """Build likely tokenize endpoint URLs for OpenAI-compatible servers."""
+    if not base_url:
+        return []
+
+    normalized = base_url.rstrip('/')
+    parsed = urlparse(normalized)
+    if not parsed.scheme or not parsed.netloc:
+        return []
+
+    candidates = []
+    candidates.append(f"{normalized}/tokenize")
+
+    if parsed.path.endswith('/v1'):
+        root_base = f"{parsed.scheme}://{parsed.netloc}{parsed.path[:-3]}".rstrip('/')
+        candidates.append(f"{root_base}/tokenize")
+    else:
+        candidates.append(f"{normalized}/v1/tokenize")
+
+    # de-duplicate while preserving order
+    unique = []
+    seen = set()
+    for item in candidates:
+        if item not in seen:
+            seen.add(item)
+            unique.append(item)
+    return unique
+
+
+def _count_tokens_via_server(text, model=None):
+    """Use vLLM/OpenAI-compatible /tokenize endpoint if available."""
+    if not OPENAI_BASE_URL:
+        return None
+
+    payload_candidates = [{"prompt": text}, {"text": text}, {"input": text}]
+
+    headers = {"Content-Type": "application/json"}
+    if OPENAI_API_KEY:
+        headers["Authorization"] = f"Bearer {OPENAI_API_KEY}"
+
+    for url in _candidate_tokenize_urls(OPENAI_BASE_URL):
+        for payload in payload_candidates:
+            if model:
+                payload = {**payload, "model": model}
+            data = json.dumps(payload).encode('utf-8')
+            try:
+                req = request.Request(url, data=data, headers=headers, method='POST')
+                with request.urlopen(req, timeout=8) as resp:
+                    body = json.loads(resp.read().decode('utf-8'))
+
+                # common response variants
+                if isinstance(body, dict):
+                    if isinstance(body.get('count'), int):
+                        return body['count']
+                    if isinstance(body.get('num_tokens'), int):
+                        return body['num_tokens']
+                    if isinstance(body.get('token_count'), int):
+                        return body['token_count']
+                    # Some providers wrap the payload
+                    if isinstance(body.get('data'), dict):
+                        nested = body['data']
+                        if isinstance(nested.get('count'), int):
+                            return nested['count']
+                        token_ids = nested.get('token_ids') or nested.get('tokens')
+                        if isinstance(token_ids, list):
+                            return len(token_ids)
+                    token_ids = body.get('token_ids') or body.get('tokens')
+                    if isinstance(token_ids, list):
+                        return len(token_ids)
+            except error.HTTPError as exc:
+                # 400 may mean payload key mismatch; try next payload candidate
+                logging.debug(f"Tokenize endpoint failed at {url}: HTTP {exc.code}")
+            except Exception as exc:
+                logging.debug(f"Tokenize endpoint failed at {url}: {exc}")
+
+    return None
+
+
+
+
+def _candidate_detokenize_urls(base_url):
+    """Build likely detokenize endpoint URLs for OpenAI-compatible servers."""
+    if not base_url:
+        return []
+    return [url.replace('/tokenize', '/detokenize') for url in _candidate_tokenize_urls(base_url)]
+
+
+def detokenize_tokens(token_ids, model=None):
+    """Best-effort detokenize via /detokenize endpoint (mainly for diagnostics)."""
+    if not OPENAI_BASE_URL:
+        return None
+
+    payload = {"tokens": token_ids}
+    if model:
+        payload["model"] = model
+
+    headers = {"Content-Type": "application/json"}
+    if OPENAI_API_KEY:
+        headers["Authorization"] = f"Bearer {OPENAI_API_KEY}"
+
+    data = json.dumps(payload).encode('utf-8')
+    for url in _candidate_detokenize_urls(OPENAI_BASE_URL):
+        try:
+            req = request.Request(url, data=data, headers=headers, method='POST')
+            with request.urlopen(req, timeout=8) as resp:
+                body = json.loads(resp.read().decode('utf-8'))
+            if isinstance(body, dict):
+                if isinstance(body.get('prompt'), str):
+                    return body['prompt']
+                if isinstance(body.get('text'), str):
+                    return body['text']
+        except Exception:
+            continue
+
+    return None
 
 def count_tokens(text, model=None):
     if not text:
         return 0
-    enc = tiktoken.encoding_for_model(model)
+
+    server_count = _count_tokens_via_server(text, model=model)
+    if server_count is not None:
+        return server_count
+
+    try:
+        if model:
+            enc = tiktoken.encoding_for_model(model)
+        else:
+            enc = tiktoken.get_encoding("cl100k_base")
+    except KeyError:
+        logging.warning(
+            f"Unknown tokenizer mapping for model '{model}', falling back to cl100k_base"
+        )
+        enc = tiktoken.get_encoding("cl100k_base")
+
     tokens = enc.encode(text)
     return len(tokens)
 
-def ChatGPT_API_with_finish_reason(model, prompt, api_key=CHATGPT_API_KEY, chat_history=None):
+def _is_context_length_error(exc):
+    message = str(exc).lower()
+    return "maximum context length" in message and "requested" in message
+
+
+def ChatGPT_API_with_finish_reason(model, prompt, api_key=OPENAI_API_KEY, chat_history=None):
     max_retries = 10
-    client = openai.OpenAI(api_key=api_key)
+    client = _build_openai_client(api_key=api_key)
     for i in range(max_retries):
         try:
             if chat_history:
@@ -48,19 +206,22 @@ def ChatGPT_API_with_finish_reason(model, prompt, api_key=CHATGPT_API_KEY, chat_
                 return response.choices[0].message.content, "finished"
 
         except Exception as e:
+            if _is_context_length_error(e):
+                logging.error(f"Context length exceeded: {e}")
+                return "Error", "context_length_exceeded"
             print('************* Retrying *************')
             logging.error(f"Error: {e}")
             if i < max_retries - 1:
                 time.sleep(1)  # Wait for 1秒 before retrying
             else:
                 logging.error('Max retries reached for prompt: ' + prompt)
-                return "Error"
+                return "Error", "error"
 
 
 
-def ChatGPT_API(model, prompt, api_key=CHATGPT_API_KEY, chat_history=None):
+def ChatGPT_API(model, prompt, api_key=OPENAI_API_KEY, chat_history=None):
     max_retries = 10
-    client = openai.OpenAI(api_key=api_key)
+    client = _build_openai_client(api_key=api_key)
     for i in range(max_retries):
         try:
             if chat_history:
@@ -77,6 +238,9 @@ def ChatGPT_API(model, prompt, api_key=CHATGPT_API_KEY, chat_history=None):
    
             return response.choices[0].message.content
         except Exception as e:
+            if _is_context_length_error(e):
+                logging.error(f"Context length exceeded: {e}")
+                return "Error"
             print('************* Retrying *************')
             logging.error(f"Error: {e}")
             if i < max_retries - 1:
@@ -86,12 +250,12 @@ def ChatGPT_API(model, prompt, api_key=CHATGPT_API_KEY, chat_history=None):
                 return "Error"
             
 
-async def ChatGPT_API_async(model, prompt, api_key=CHATGPT_API_KEY):
+async def ChatGPT_API_async(model, prompt, api_key=OPENAI_API_KEY):
     max_retries = 10
     messages = [{"role": "user", "content": prompt}]
     for i in range(max_retries):
         try:
-            async with openai.AsyncOpenAI(api_key=api_key) as client:
+            async with _build_openai_client(async_client=True, api_key=api_key) as client:
                 response = await client.chat.completions.create(
                     model=model,
                     messages=messages,
@@ -99,6 +263,9 @@ async def ChatGPT_API_async(model, prompt, api_key=CHATGPT_API_KEY):
                 )
                 return response.choices[0].message.content
         except Exception as e:
+            if _is_context_length_error(e):
+                logging.error(f"Context length exceeded: {e}")
+                return "Error"
             print('************* Retrying *************')
             logging.error(f"Error: {e}")
             if i < max_retries - 1:
