@@ -17,7 +17,27 @@ import yaml
 from pathlib import Path
 from types import SimpleNamespace as config
 
-CHATGPT_API_KEY = os.getenv("CHATGPT_API_KEY")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") or os.getenv("CHATGPT_API_KEY")
+OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL")
+
+
+def _build_openai_client(async_client=False, api_key=None):
+    """
+    Build an OpenAI/compatible client with optional custom base URL.
+
+    Supported env vars:
+      - OPENAI_API_KEY (preferred)
+      - CHATGPT_API_KEY (backward compatibility)
+      - OPENAI_BASE_URL (for OpenAI-compatible providers)
+    """
+    effective_api_key = api_key or OPENAI_API_KEY
+    client_kwargs = {"api_key": effective_api_key}
+    if OPENAI_BASE_URL:
+        client_kwargs["base_url"] = OPENAI_BASE_URL
+
+    if async_client:
+        return openai.AsyncOpenAI(**client_kwargs)
+    return openai.OpenAI(**client_kwargs)
 
 def count_tokens(text, model=None):
     if not text:
@@ -26,9 +46,9 @@ def count_tokens(text, model=None):
     tokens = enc.encode(text)
     return len(tokens)
 
-def ChatGPT_API_with_finish_reason(model, prompt, api_key=CHATGPT_API_KEY, chat_history=None):
+def ChatGPT_API_with_finish_reason(model, prompt, api_key=OPENAI_API_KEY, chat_history=None):
     max_retries = 10
-    client = openai.OpenAI(api_key=api_key)
+    client = _build_openai_client(api_key=api_key)
     for i in range(max_retries):
         try:
             if chat_history:
@@ -58,9 +78,9 @@ def ChatGPT_API_with_finish_reason(model, prompt, api_key=CHATGPT_API_KEY, chat_
 
 
 
-def ChatGPT_API(model, prompt, api_key=CHATGPT_API_KEY, chat_history=None):
+def ChatGPT_API(model, prompt, api_key=OPENAI_API_KEY, chat_history=None):
     max_retries = 10
-    client = openai.OpenAI(api_key=api_key)
+    client = _build_openai_client(api_key=api_key)
     for i in range(max_retries):
         try:
             if chat_history:
@@ -86,12 +106,12 @@ def ChatGPT_API(model, prompt, api_key=CHATGPT_API_KEY, chat_history=None):
                 return "Error"
             
 
-async def ChatGPT_API_async(model, prompt, api_key=CHATGPT_API_KEY):
+async def ChatGPT_API_async(model, prompt, api_key=OPENAI_API_KEY):
     max_retries = 10
     messages = [{"role": "user", "content": prompt}]
     for i in range(max_retries):
         try:
-            async with openai.AsyncOpenAI(api_key=api_key) as client:
+            async with _build_openai_client(async_client=True, api_key=api_key) as client:
                 response = await client.chat.completions.create(
                     model=model,
                     messages=messages,
