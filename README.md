@@ -161,6 +161,19 @@ CHAT_MODEL_NAME=your_model_name
 # CHATGPT_API_KEY=your_openai_key_here
 ```
 
+
+### Troubleshooting (OpenAI-compatible + vLLM)
+
+If you use a custom model name (for example `qwen2:72b` or vLLM `served-model-name`), `tiktoken` may not recognize it.
+
+PageIndex now tries to count tokens using your server's `/tokenize` endpoint first (derived from `OPENAI_BASE_URL`), and only then falls back to local `tiktoken` (`cl100k_base`). This prevents errors like:
+
+```
+KeyError: Could not automatically map <model_name> to a tokeniser
+```
+
+For vLLM, keep `OPENAI_BASE_URL` pointed at your server (for example `http://localhost:8000/v1`).
+
 ### 3. Run PageIndex on your PDF
 
 ```bash

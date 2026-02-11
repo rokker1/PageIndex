@@ -9,6 +9,8 @@ import PyPDF2
 import copy
 import asyncio
 import pymupdf
+from urllib import request, error
+from urllib.parse import urlparse
 from io import BytesIO
 from dotenv import load_dotenv
 load_dotenv()
@@ -39,10 +41,132 @@ def _build_openai_client(async_client=False, api_key=None):
         return openai.AsyncOpenAI(**client_kwargs)
     return openai.OpenAI(**client_kwargs)
 
+def _candidate_tokenize_urls(base_url):
+    """Build likely tokenize endpoint URLs for OpenAI-compatible servers."""
+    if not base_url:
+        return []
+
+    normalized = base_url.rstrip('/')
+    parsed = urlparse(normalized)
+    if not parsed.scheme or not parsed.netloc:
+        return []
+
+    candidates = []
+    candidates.append(f"{normalized}/tokenize")
+
+    if parsed.path.endswith('/v1'):
+        root_base = f"{parsed.scheme}://{parsed.netloc}{parsed.path[:-3]}".rstrip('/')
+        candidates.append(f"{root_base}/tokenize")
+    else:
+        candidates.append(f"{normalized}/v1/tokenize")
+
+    # de-duplicate while preserving order
+    unique = []
+    seen = set()
+    for item in candidates:
+        if item not in seen:
+            seen.add(item)
+            unique.append(item)
+    return unique
+
+
+def _count_tokens_via_server(text, model=None):
+    """Use vLLM/OpenAI-compatible /tokenize endpoint if available."""
+    if not OPENAI_BASE_URL:
+        return None
+
+    payload = {"prompt": text}
+    if model:
+        payload["model"] = model
+
+    headers = {"Content-Type": "application/json"}
+    if OPENAI_API_KEY:
+        headers["Authorization"] = f"Bearer {OPENAI_API_KEY}"
+
+    data = json.dumps(payload).encode('utf-8')
+    for url in _candidate_tokenize_urls(OPENAI_BASE_URL):
+        try:
+            req = request.Request(url, data=data, headers=headers, method='POST')
+            with request.urlopen(req, timeout=8) as resp:
+                body = json.loads(resp.read().decode('utf-8'))
+
+            # common response variants
+            if isinstance(body, dict):
+                if isinstance(body.get('count'), int):
+                    return body['count']
+                if isinstance(body.get('num_tokens'), int):
+                    return body['num_tokens']
+                if isinstance(body.get('token_count'), int):
+                    return body['token_count']
+                token_ids = body.get('token_ids') or body.get('tokens')
+                if isinstance(token_ids, list):
+                    return len(token_ids)
+        except error.HTTPError as exc:
+            # 404/405 => try another candidate URL; other codes can still be provider-specific
+            logging.debug(f"Tokenize endpoint failed at {url}: HTTP {exc.code}")
+        except Exception as exc:
+            logging.debug(f"Tokenize endpoint failed at {url}: {exc}")
+
+    return None
+
+
+
+
+def _candidate_detokenize_urls(base_url):
+    """Build likely detokenize endpoint URLs for OpenAI-compatible servers."""
+    if not base_url:
+        return []
+    return [url.replace('/tokenize', '/detokenize') for url in _candidate_tokenize_urls(base_url)]
+
+
+def detokenize_tokens(token_ids, model=None):
+    """Best-effort detokenize via /detokenize endpoint (mainly for diagnostics)."""
+    if not OPENAI_BASE_URL:
+        return None
+
+    payload = {"tokens": token_ids}
+    if model:
+        payload["model"] = model
+
+    headers = {"Content-Type": "application/json"}
+    if OPENAI_API_KEY:
+        headers["Authorization"] = f"Bearer {OPENAI_API_KEY}"
+
+    data = json.dumps(payload).encode('utf-8')
+    for url in _candidate_detokenize_urls(OPENAI_BASE_URL):
+        try:
+            req = request.Request(url, data=data, headers=headers, method='POST')
+            with request.urlopen(req, timeout=8) as resp:
+                body = json.loads(resp.read().decode('utf-8'))
+            if isinstance(body, dict):
+                if isinstance(body.get('prompt'), str):
+                    return body['prompt']
+                if isinstance(body.get('text'), str):
+                    return body['text']
+        except Exception:
+            continue
+
+    return None
+
 def count_tokens(text, model=None):
     if not text:
         return 0
-    enc = tiktoken.encoding_for_model(model)
+
+    server_count = _count_tokens_via_server(text, model=model)
+    if server_count is not None:
+        return server_count
+
+    try:
+        if model:
+            enc = tiktoken.encoding_for_model(model)
+        else:
+            enc = tiktoken.get_encoding("cl100k_base")
+    except KeyError:
+        logging.warning(
+            f"Unknown tokenizer mapping for model '{model}', falling back to cl100k_base"
+        )
+        enc = tiktoken.get_encoding("cl100k_base")
+
     tokens = enc.encode(text)
     return len(tokens)
 
