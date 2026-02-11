@@ -198,7 +198,7 @@ def ChatGPT_API_with_finish_reason(model, prompt, api_key=OPENAI_API_KEY, chat_h
                 time.sleep(1)  # Wait for 1秒 before retrying
             else:
                 logging.error('Max retries reached for prompt: ' + prompt)
-                return "Error"
+                return "Error", "error"
 
 
 
