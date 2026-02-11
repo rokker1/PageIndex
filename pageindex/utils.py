@@ -75,37 +75,46 @@ def _count_tokens_via_server(text, model=None):
     if not OPENAI_BASE_URL:
         return None
 
-    payload = {"prompt": text}
-    if model:
-        payload["model"] = model
+    payload_candidates = [{"prompt": text}, {"text": text}, {"input": text}]
 
     headers = {"Content-Type": "application/json"}
     if OPENAI_API_KEY:
         headers["Authorization"] = f"Bearer {OPENAI_API_KEY}"
 
-    data = json.dumps(payload).encode('utf-8')
     for url in _candidate_tokenize_urls(OPENAI_BASE_URL):
-        try:
-            req = request.Request(url, data=data, headers=headers, method='POST')
-            with request.urlopen(req, timeout=8) as resp:
-                body = json.loads(resp.read().decode('utf-8'))
+        for payload in payload_candidates:
+            if model:
+                payload = {**payload, "model": model}
+            data = json.dumps(payload).encode('utf-8')
+            try:
+                req = request.Request(url, data=data, headers=headers, method='POST')
+                with request.urlopen(req, timeout=8) as resp:
+                    body = json.loads(resp.read().decode('utf-8'))
 
-            # common response variants
-            if isinstance(body, dict):
-                if isinstance(body.get('count'), int):
-                    return body['count']
-                if isinstance(body.get('num_tokens'), int):
-                    return body['num_tokens']
-                if isinstance(body.get('token_count'), int):
-                    return body['token_count']
-                token_ids = body.get('token_ids') or body.get('tokens')
-                if isinstance(token_ids, list):
-                    return len(token_ids)
-        except error.HTTPError as exc:
-            # 404/405 => try another candidate URL; other codes can still be provider-specific
-            logging.debug(f"Tokenize endpoint failed at {url}: HTTP {exc.code}")
-        except Exception as exc:
-            logging.debug(f"Tokenize endpoint failed at {url}: {exc}")
+                # common response variants
+                if isinstance(body, dict):
+                    if isinstance(body.get('count'), int):
+                        return body['count']
+                    if isinstance(body.get('num_tokens'), int):
+                        return body['num_tokens']
+                    if isinstance(body.get('token_count'), int):
+                        return body['token_count']
+                    # Some providers wrap the payload
+                    if isinstance(body.get('data'), dict):
+                        nested = body['data']
+                        if isinstance(nested.get('count'), int):
+                            return nested['count']
+                        token_ids = nested.get('token_ids') or nested.get('tokens')
+                        if isinstance(token_ids, list):
+                            return len(token_ids)
+                    token_ids = body.get('token_ids') or body.get('tokens')
+                    if isinstance(token_ids, list):
+                        return len(token_ids)
+            except error.HTTPError as exc:
+                # 400 may mean payload key mismatch; try next payload candidate
+                logging.debug(f"Tokenize endpoint failed at {url}: HTTP {exc.code}")
+            except Exception as exc:
+                logging.debug(f"Tokenize endpoint failed at {url}: {exc}")
 
     return None
 
@@ -170,6 +179,11 @@ def count_tokens(text, model=None):
     tokens = enc.encode(text)
     return len(tokens)
 
+def _is_context_length_error(exc):
+    message = str(exc).lower()
+    return "maximum context length" in message and "requested" in message
+
+
 def ChatGPT_API_with_finish_reason(model, prompt, api_key=OPENAI_API_KEY, chat_history=None):
     max_retries = 10
     client = _build_openai_client(api_key=api_key)
@@ -192,6 +206,9 @@ def ChatGPT_API_with_finish_reason(model, prompt, api_key=OPENAI_API_KEY, chat_h
                 return response.choices[0].message.content, "finished"
 
         except Exception as e:
+            if _is_context_length_error(e):
+                logging.error(f"Context length exceeded: {e}")
+                return "Error", "context_length_exceeded"
             print('************* Retrying *************')
             logging.error(f"Error: {e}")
             if i < max_retries - 1:
@@ -221,6 +238,9 @@ def ChatGPT_API(model, prompt, api_key=OPENAI_API_KEY, chat_history=None):
    
             return response.choices[0].message.content
         except Exception as e:
+            if _is_context_length_error(e):
+                logging.error(f"Context length exceeded: {e}")
+                return "Error"
             print('************* Retrying *************')
             logging.error(f"Error: {e}")
             if i < max_retries - 1:
@@ -243,6 +263,9 @@ async def ChatGPT_API_async(model, prompt, api_key=OPENAI_API_KEY):
                 )
                 return response.choices[0].message.content
         except Exception as e:
+            if _is_context_length_error(e):
+                logging.error(f"Context length exceeded: {e}")
+                return "Error"
             print('************* Retrying *************')
             logging.error(f"Error: {e}")
             if i < max_retries - 1:

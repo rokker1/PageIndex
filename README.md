@@ -174,6 +174,14 @@ KeyError: Could not automatically map <model_name> to a tokeniser
 
 For vLLM, keep `OPENAI_BASE_URL` pointed at your server (for example `http://localhost:8000/v1`).
 
+If your model has a smaller context window (for example 16k), set a safer prompt budget:
+
+```bash
+PAGEINDEX_PROMPT_MAX_TOKENS=12000
+```
+
+This controls how aggressively PageIndex groups pages before sending prompts and helps avoid `maximum context length` API errors.
+
 ### 3. Run PageIndex on your PDF
 
 ```bash
